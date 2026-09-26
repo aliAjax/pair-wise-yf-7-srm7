@@ -23,6 +23,7 @@ const defaultState = {
 };
 
 let state = loadState();
+let boardAnalysis = { entries: [], pendingKeys: new Set(), totalMissing: 0, usedCount: 0 };
 
 const els = {
   paperSize: document.querySelector("#paperSize"),
@@ -47,7 +48,8 @@ const els = {
   inventoryCount: document.querySelector("#inventoryCount"),
   saveDraftBtn: document.querySelector("#saveDraftBtn"),
   exportBtn: document.querySelector("#exportBtn"),
-  clearBoardBtn: document.querySelector("#clearBoardBtn")
+  clearBoardBtn: document.querySelector("#clearBoardBtn"),
+  exportNotice: document.querySelector("#exportNotice")
 };
 
 function loadState() {
@@ -55,11 +57,29 @@ function loadState() {
   if (!saved) return structuredClone(defaultState);
   try {
     const parsed = JSON.parse(saved);
-    return {
+    const merged = {
       ...structuredClone(defaultState),
       ...parsed,
       settings: { ...defaultState.settings, ...parsed.settings }
     };
+    merged.placements ||= [];
+    merged.drafts ||= [];
+    // 旧版落字记录没有字模快照，按当前字模库补齐，补不上的只能留空
+    merged.placements.forEach((placement) => {
+      if (!placement.snapshot) {
+        const type = merged.inventory.find((item) => item.id === placement.typeId);
+        placement.snapshot = type ? snapshotOf(type) : { char: "", style: "", size: null, wear: "" };
+      }
+    });
+    merged.drafts.forEach((draft) => {
+      (draft.placements || []).forEach((placement) => {
+        if (!placement.snapshot) {
+          const type = merged.inventory.find((item) => item.id === placement.typeId);
+          placement.snapshot = type ? snapshotOf(type) : { char: "", style: "", size: null, wear: "" };
+        }
+      });
+    });
+    return merged;
   } catch {
     return structuredClone(defaultState);
   }
@@ -80,15 +100,144 @@ function placementKey(row, col) {
   return `${row}:${col}`;
 }
 
+function typeSignature(char, style) {
+  return `${char}__${style}`;
+}
+
+function snapshotOf(type) {
+  return { char: type.char, style: type.style, size: type.size, wear: type.wear };
+}
+
 function getSelectedType() {
   return state.inventory.find((item) => item.id === state.selectedTypeId) || null;
 }
 
-function getUsage() {
-  return state.placements.reduce((acc, placement) => {
-    acc[placement.typeId] = (acc[placement.typeId] || 0) + 1;
-    return acc;
-  }, {});
+function placementSnapshot(placement) {
+  const type = state.inventory.find((item) => item.id === placement.typeId);
+  if (type) {
+    placement.snapshot = snapshotOf(type);
+    return placement.snapshot;
+  }
+  return placement.snapshot || { char: "", style: "", size: null, wear: "" };
+}
+
+/**
+ * 让一份落字记录与当前字模库对账：
+ * - 字模被清走时，落字保留原字模信息，只标记待补；
+ * - 库里补进同字同风格的新字模（或同款增补余量）时，按阅读顺序把待补落字挂回去；
+ * - 尽量粘住原有绑定，只有超量/缺料的尾部落字才挪给有余量的同款字模。
+ */
+function reconcilePlacements(placements) {
+  const ordered = [...placements].sort((a, b) => a.row - b.row || a.col - b.col);
+  const groups = new Map();
+  ordered.forEach((placement) => {
+    if (!placement.snapshot) placement.snapshot = { char: "", style: "", size: null, wear: "" };
+    const sig = typeSignature(placement.snapshot.char || "", placement.snapshot.style || "");
+    if (!groups.has(sig)) groups.set(sig, []);
+    groups.get(sig).push(placement);
+  });
+
+  groups.forEach((pool) => {
+    // 失效绑定（字模已清走）先摘钩
+    pool.forEach((placement) => {
+      if (placement.typeId && !state.inventory.some((item) => item.id === placement.typeId)) {
+        placement.typeId = null;
+      }
+    });
+
+    const countUsed = () => {
+      const used = new Map();
+      pool.forEach((placement) => {
+        if (placement.typeId) used.set(placement.typeId, (used.get(placement.typeId) || 0) + 1);
+      });
+      return used;
+    };
+
+    // 可挪动：已摘钩的，或挂在现有字模上但超出该款枚数的尾部落字
+    const isMovable = (placement, used) => {
+      if (!placement.typeId) return true;
+      const card = state.inventory.find((item) => item.id === placement.typeId);
+      return card ? (used.get(card.id) || 0) > card.quantity : true;
+    };
+
+    pool.forEach((placement) => {
+      const used = countUsed();
+      if (!isMovable(placement, used)) return;
+      const snap = placement.snapshot;
+      const targets = state.inventory
+        .filter(
+          (item) =>
+            item.style === snap.style &&
+            item.char === snap.char &&
+            item.id !== placement.typeId &&
+            (used.get(item.id) || 0) < item.quantity
+        )
+        .sort((a, b) => {
+          const sizeA = snap.size === a.size ? 1 : 0;
+          const sizeB = snap.size === b.size ? 1 : 0;
+          if (sizeA !== sizeB) return sizeB - sizeA;
+          return b.quantity - (used.get(b.id) || 0) - (a.quantity - (used.get(a.id) || 0));
+        });
+      const target = targets[0];
+      if (!target) return;
+      placement.typeId = target.id;
+      placement.snapshot = snapshotOf(target);
+    });
+  });
+}
+
+/**
+ * 统计一份落字记录相对当前字模库的缺口：
+ * 待补格按阅读顺序取每组落字的尾部，保证标红的就是溢出/缺料的那几枚。
+ */
+function analyzePlacements(placements) {
+  const ordered = [...placements].sort((a, b) => a.row - b.row || a.col - b.col);
+  const buckets = new Map();
+  ordered.forEach((placement) => {
+    const key = placement.typeId || `ghost:${typeSignature(
+      placement.snapshot?.char || "",
+      placement.snapshot?.style || ""
+    )}`;
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(placement);
+  });
+
+  const entries = [];
+  const pendingKeys = new Set();
+  let totalMissing = 0;
+
+  buckets.forEach((items, key) => {
+    const type = key.startsWith("ghost:")
+      ? null
+      : state.inventory.find((item) => item.id === key) || null;
+    const snapshot = items[0].snapshot || { char: "", style: "", size: null, wear: "" };
+    const quantity = type ? type.quantity : 0;
+    const used = items.length;
+    const missing = Math.max(0, used - quantity);
+    if (missing > 0) {
+      totalMissing += missing;
+      items.slice(-missing).forEach((item) => pendingKeys.add(placementKey(item.row, item.col)));
+    }
+    entries.push({
+      key,
+      type,
+      char: type ? type.char : snapshot.char || "?",
+      style: type ? type.style : snapshot.style || "未知风格",
+      size: type ? type.size : snapshot.size,
+      wear: type ? type.wear : snapshot.wear,
+      quantity,
+      used,
+      missing,
+      removed: !type
+    });
+  });
+
+  entries.sort((a, b) => {
+    if (b.missing - a.missing !== 0) return b.missing - a.missing;
+    return a.char.localeCompare(b.char, "zh-CN");
+  });
+
+  return { entries, pendingKeys, totalMissing, usedCount: placements.length };
 }
 
 function renderSettings() {
@@ -110,7 +259,7 @@ function renderStyleFilter() {
 function renderInventory() {
   const keyword = els.inventorySearch.value.trim();
   const style = els.styleFilter.value;
-  const usage = getUsage();
+  const boardUsage = new Map(boardAnalysis.entries.map((entry) => [entry.key, entry.used]));
   const items = state.inventory.filter((item) => {
     const matchesKeyword = !keyword || `${item.char}${item.style}${item.wear}`.includes(keyword);
     const matchesStyle = style === "all" || item.style === style;
@@ -120,10 +269,11 @@ function renderInventory() {
   els.inventoryCount.textContent = `${state.inventory.length}枚字模`;
   els.typeList.innerHTML = items
     .map((item) => {
-      const used = usage[item.id] || 0;
+      const used = boardUsage.get(item.id) || 0;
       const selected = item.id === state.selectedTypeId ? "selected" : "";
+      const short = used > item.quantity ? "short" : "";
       return `
-        <article class="type-card ${selected}" draggable="true" data-type-id="${item.id}">
+        <article class="type-card ${selected} ${short}" draggable="true" data-type-id="${item.id}">
           <div class="glyph" style="font-size:${Math.min(item.size, 36)}px">${escapeHtml(item.char)}</div>
           <div class="type-meta">
             <strong>${escapeHtml(item.char)} · ${escapeHtml(item.style)}</strong>
@@ -143,15 +293,30 @@ function renderStage() {
   els.stage.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
   els.stage.style.gridTemplateRows = `repeat(${rows}, minmax(0, 1fr))`;
   els.stage.style.gap = `${state.settings.gridGap}px`;
+  const vertical = state.settings.flowMode === "vertical" ? "vertical" : "";
   const cells = [];
   for (let row = 0; row < rows; row += 1) {
     for (let col = 0; col < cols; col += 1) {
-      const placement = map.get(placementKey(row, col));
-      const type = placement ? state.inventory.find((item) => item.id === placement.typeId) : null;
-      const vertical = state.settings.flowMode === "vertical" ? "vertical" : "";
+      const key = placementKey(row, col);
+      const placement = map.get(key);
+      if (!placement) {
+        cells.push(`
+          <button class="cell ${vertical}" data-row="${row}" data-col="${col}" type="button" aria-label="第${row + 1}行第${col + 1}列空格"></button>
+        `);
+        continue;
+      }
+      const pending = boardAnalysis.pendingKeys.has(key);
+      const type = state.inventory.find((item) => item.id === placement.typeId);
+      const snap = placementSnapshot(placement);
+      const char = type ? type.char : snap.char;
+      const stateClass = pending ? "pending" : "used";
+      const label = pending
+        ? `第${row + 1}行第${col + 1}列：待补「${char}」，点击用当前字模替换`
+        : `第${row + 1}行第${col + 1}列：${char}`;
       cells.push(`
-        <button class="cell ${type ? "used" : ""} ${vertical}" data-row="${row}" data-col="${col}" type="button" aria-label="第${row + 1}行第${col + 1}列">
-          ${type ? escapeHtml(type.char) : ""}
+        <button class="cell ${stateClass} ${vertical}" data-row="${row}" data-col="${col}" type="button" aria-label="${escapeHtml(label)}">
+          <span class="cell-glyph">${escapeHtml(char)}</span>
+          ${pending ? '<span class="cell-tag">待补</span>' : ""}
         </button>
       `);
     }
@@ -160,26 +325,35 @@ function renderStage() {
 }
 
 function renderUsage() {
-  const usage = getUsage();
-  const entries = state.inventory.filter((item) => usage[item.id]);
-  els.placedCount.textContent = `${state.placements.length}个落字`;
+  els.placedCount.textContent = boardAnalysis.totalMissing
+    ? `${boardAnalysis.usedCount}个落字 · 缺${boardAnalysis.totalMissing}枚`
+    : `${boardAnalysis.usedCount}个落字`;
 
-  const shortages = entries.filter((item) => usage[item.id] > item.quantity);
-  els.shortageBadge.textContent = shortages.length ? `${shortages.length}处超量` : "数量充足";
-  els.shortageBadge.className = `badge ${shortages.length ? "warn" : "ok"}`;
+  els.shortageBadge.textContent = boardAnalysis.totalMissing
+    ? `缺字 ${boardAnalysis.totalMissing} 枚`
+    : "数量充足";
+  els.shortageBadge.className = `badge ${boardAnalysis.totalMissing ? "warn" : "ok"}`;
 
   const selectedType = getSelectedType();
-  els.selectedTypeLabel.textContent = selectedType ? `当前：${selectedType.char} · ${selectedType.style}` : "未选择字模";
+  els.selectedTypeLabel.textContent = selectedType
+    ? `当前：${selectedType.char} · ${selectedType.style}`
+    : "未选择字模";
 
   els.usageList.innerHTML =
-    entries
-      .map((item) => {
-        const used = usage[item.id];
-        const warn = used > item.quantity ? "warn" : "";
+    boardAnalysis.entries
+      .map((entry) => {
+        const classes = ["usage-item"];
+        if (entry.missing > 0) classes.push("warn");
+        if (entry.removed) classes.push("removed");
+        const meta = entry.removed
+          ? `字模已清走 · 缺${entry.missing}枚`
+          : entry.missing
+            ? `${entry.used}/${entry.quantity} · 缺${entry.missing}枚`
+            : `${entry.used}/${entry.quantity}`;
         return `
-          <div class="usage-item ${warn}">
-            <strong>${escapeHtml(item.char)} ${escapeHtml(item.style)}</strong>
-            <span>${used}/${item.quantity}</span>
+          <div class="${classes.join(" ")}">
+            <strong>${escapeHtml(entry.char)} · ${escapeHtml(entry.style)}</strong>
+            <span>${escapeHtml(meta)}</span>
           </div>
         `;
       })
@@ -189,22 +363,74 @@ function renderUsage() {
 function renderDrafts() {
   els.draftList.innerHTML =
     state.drafts
-      .map(
-        (draft) => `
-          <article class="draft-item">
+      .map((draft) => {
+        const report = analyzePlacements(draft.placements);
+        let status;
+        if (report.totalMissing) {
+          const details = report.entries
+            .filter((entry) => entry.missing > 0)
+            .map((entry) => {
+              const reason = entry.removed ? "已清走" : "不足";
+              return `${escapeHtml(entry.char)}·${escapeHtml(entry.style)}（${reason}，缺${entry.missing}枚）`;
+            })
+            .join("；");
+          status = `<span class="draft-status gap">缺字 ${report.totalMissing} 枚：${details}</span>`;
+        } else {
+          status = `<span class="draft-status ok">字模齐备，可导出</span>`;
+        }
+        return `
+          <article class="draft-item ${report.totalMissing ? "has-gap" : ""}">
             <strong>${escapeHtml(draft.title)}</strong>
             <span>${draft.placements.length}个落字 · ${new Date(draft.savedAt).toLocaleString("zh-CN")}</span>
+            ${status}
             <div class="draft-actions">
               <button type="button" data-load-draft="${draft.id}">载入</button>
               <button type="button" data-delete-draft="${draft.id}">删除</button>
             </div>
           </article>
-        `
-      )
+        `;
+      })
       .join("") || `<p class="empty">还没有保存草稿。</p>`;
 }
 
-function renderAll() {
+function renderExportNotice(mode = "idle") {
+  if (mode === "success" && !boardAnalysis.totalMissing) {
+    els.exportNotice.hidden = false;
+    els.exportNotice.className = "export-notice ok show";
+    els.exportNotice.innerHTML = `
+      <strong>已导出预览图</strong>
+      <span>《${escapeHtml(state.settings.workTitle || "未命名作品")}》字模齐备，PNG 预览已生成下载。</span>
+    `;
+    return;
+  }
+  if (boardAnalysis.totalMissing) {
+    const lines = boardAnalysis.entries
+      .filter((entry) => entry.missing > 0)
+      .map((entry) => {
+        const reason = entry.removed ? "该款字模已被清走" : "库存不足";
+        return `<li>「${escapeHtml(entry.char)}」${escapeHtml(entry.style)} — ${reason}，缺 <strong>${entry.missing}</strong> 枚（已用 ${entry.used}/${entry.quantity}）</li>`;
+      })
+      .join("");
+    els.exportNotice.hidden = false;
+    els.exportNotice.className = `export-notice gap ${mode === "blocked" ? "show pulse" : "show"}`;
+    els.exportNotice.innerHTML = `
+      <strong>尚有 ${boardAnalysis.totalMissing} 枚缺字，不能导出预览</strong>
+      <ul>${lines}</ul>
+      <span>请补齐相应字模，或把标红的待补格换用现有字模后再导出。</span>
+    `;
+    return;
+  }
+  els.exportNotice.hidden = true;
+  els.exportNotice.className = "export-notice";
+  els.exportNotice.innerHTML = "";
+}
+
+function renderAll(noticeMode = "idle") {
+  reconcilePlacements(state.placements);
+  state.drafts.forEach((draft) => reconcilePlacements(draft.placements));
+  // 归补后刷新字模快照（同款字模可能换了枚数或磨损）
+  state.placements.forEach((placement) => placementSnapshot(placement));
+  boardAnalysis = analyzePlacements(state.placements);
   saveState();
   renderSettings();
   renderStyleFilter();
@@ -212,6 +438,7 @@ function renderAll() {
   renderStage();
   renderUsage();
   renderDrafts();
+  renderExportNotice(noticeMode);
 }
 
 function placeType(row, col, typeId = state.selectedTypeId) {
@@ -222,9 +449,12 @@ function placeType(row, col, typeId = state.selectedTypeId) {
       state.placements.splice(existingIndex, 1);
     } else {
       state.placements[existingIndex].typeId = typeId;
+      const type = state.inventory.find((item) => item.id === typeId);
+      state.placements[existingIndex].snapshot = type ? snapshotOf(type) : state.placements[existingIndex].snapshot;
     }
   } else {
-    state.placements.push({ row, col, typeId });
+    const type = state.inventory.find((item) => item.id === typeId);
+    state.placements.push({ row, col, typeId, snapshot: type ? snapshotOf(type) : { char: "", style: "", size: null, wear: "" } });
   }
   renderAll();
 }
@@ -262,6 +492,12 @@ function saveDraft() {
 }
 
 function exportPreview() {
+  if (boardAnalysis.totalMissing) {
+    renderExportNotice("blocked");
+    els.exportNotice.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    return;
+  }
+
   const { cols, rows } = getGrid();
   const cell = state.settings.paperSize === "bookmark" ? 44 : 56;
   const gap = state.settings.gridGap;
@@ -280,7 +516,6 @@ function exportPreview() {
   ctx.fillStyle = "#22201c";
   ctx.font = "bold 28px sans-serif";
   ctx.fillText(state.settings.workTitle || "未命名作品", margin, 50);
-  ctx.font = "bold 30px serif";
   state.placements.forEach((placement) => {
     const type = state.inventory.find((item) => item.id === placement.typeId);
     if (!type) return;
@@ -298,6 +533,7 @@ function exportPreview() {
   link.download = `${state.settings.workTitle || "movable-type"}.png`;
   link.href = canvas.toDataURL("image/png");
   link.click();
+  renderExportNotice("success");
 }
 
 function escapeHtml(value) {
@@ -311,7 +547,7 @@ function escapeHtml(value) {
 
 els.paperSize.addEventListener("change", () => {
   state.settings.paperSize = els.paperSize.value;
-  const { cols, rows } = getGrid();
+  const { rows, cols } = getGrid();
   state.placements = state.placements.filter((item) => item.row < rows && item.col < cols);
   renderAll();
 });
@@ -346,7 +582,7 @@ els.typeList.addEventListener("click", (event) => {
   if (deleteButton) {
     const typeId = deleteButton.dataset.deleteType;
     state.inventory = state.inventory.filter((item) => item.id !== typeId);
-    state.placements = state.placements.filter((item) => item.typeId !== typeId);
+    // 不再连带删除落字：它们保留原字并转为待补，等补字模或换用现有字模
     if (state.selectedTypeId === typeId) state.selectedTypeId = state.inventory[0]?.id || null;
     renderAll();
     return;
